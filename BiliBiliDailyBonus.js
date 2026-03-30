@@ -4,6 +4,8 @@
 更新时间: 2025-05-16
 脚本兼容: QuantumultX, Surge, Loon
 脚本作者: MartinsKing（@ClydeTime）
+原始项目: https://github.com/ClydeTime/BiliBili
+当前维护: WenJiazhi（仅调整 Loon 下投币结果判定与返回日志）
 软件功能: 登录/观看/分享/投币/直播签到/银瓜子转硬币/大会员积分签到/年度大会员每月B币券+等任务
 注意事项:
 	抓取cookie时注意保证账号登录状态;
@@ -82,7 +84,24 @@ const generateSign = body => md5(
 const isCoinRequestSuccessful = body =>
 	body?.code === 0 && [0, "0", "success", "Success", "", null, undefined].includes(body?.message)
 
-const markCoinSuccess = latestCoins => {
+const updateCoinTrace = ({ responseBody, beforeCoins, afterCoins, verified = false, note = "" }) => {
+	const result = {
+		time: startTime,
+		code: responseBody?.code ?? null,
+		message: responseBody?.message ?? "",
+		beforeCoins,
+		afterCoins,
+		verified,
+		note
+	}
+	if (typeof responseBody?.data !== "undefined") result.data = responseBody.data
+	config.coins.last_result = result
+	$.log(`- 投币接口返回 code=${result.code}, message=${result.message}`)
+	if (typeof responseBody?.data !== "undefined") $.log("- 投币接口返回 data=" + $.toStr(responseBody.data))
+	$.log(`- 投币经验复核 before=${beforeCoins}, after=${afterCoins}, verified=${verified}, note=${note}`)
+}
+
+const markCoinSuccess = (latestCoins, responseBody, verified = false) => {
 	const beforeCoins = Number(config.coins.num || 0)
 	const nextCoins = typeof latestCoins === "number" ? latestCoins : beforeCoins + 10
 	const gainedCoins = Math.max(0, nextCoins - beforeCoins)
@@ -92,10 +111,17 @@ const markCoinSuccess = latestCoins => {
 	}
 	config.coins.num = nextCoins
 	config.coins.time = startTime
+	updateCoinTrace({
+		responseBody,
+		beforeCoins,
+		afterCoins: nextCoins,
+		verified,
+		note: verified ? "reward-confirmed" : "api-success"
+	})
 	$.setItem($.name + "_daily_bonus", $.toStr(config))
 }
 
-async function verifyCoinResult(beforeCoins) {
+async function verifyCoinResult(beforeCoins, responseBody) {
 	const myRequest = {
 		url: "https://api.bilibili.com/x/member/web/exp/reward",
 		headers: {
@@ -108,16 +134,31 @@ async function verifyCoinResult(beforeCoins) {
 			if (body?.code !== 0) {
 				$.log("- 投币结果复核失败")
 				$.log("- 原因 " + body?.message)
+				updateCoinTrace({
+					responseBody,
+					beforeCoins,
+					afterCoins: beforeCoins,
+					verified: false,
+					note: "reward-query-failed"
+				})
+				$.setItem($.name + "_daily_bonus", $.toStr(config))
 				return false
 			}
 			const latestCoins = Number(body?.data?.coins || 0)
 			if (latestCoins > beforeCoins) {
 				$.log(`- 接口返回异常，但复核确认今日投币经验已增加 ${latestCoins - beforeCoins}`)
-				markCoinSuccess(latestCoins)
+				markCoinSuccess(latestCoins, responseBody, true)
 				return true
 			}
 			config.coins.num = latestCoins
 			if (latestCoins > 0 && !config['coins'].hasOwnProperty("time")) config.coins.time = startTime
+			updateCoinTrace({
+				responseBody,
+				beforeCoins,
+				afterCoins: latestCoins,
+				verified: false,
+				note: "reward-not-changed"
+			})
 			$.setItem($.name + "_daily_bonus", $.toStr(config))
 			return false
 		} catch (e) {
@@ -127,6 +168,14 @@ async function verifyCoinResult(beforeCoins) {
 	}, reason => {
 		$.log("- 投币结果复核失败")
 		$.log("- 原因 " + $.toStr(reason))
+		updateCoinTrace({
+			responseBody,
+			beforeCoins,
+			afterCoins: beforeCoins,
+			verified: false,
+			note: "reward-request-error"
+		})
+		$.setItem($.name + "_daily_bonus", $.toStr(config))
 		return false
 	})
 }
@@ -525,9 +574,9 @@ async function coin() {
 					const beforeCoins = Number(config.coins.num || 0)
 					const body = $.toObj(response.body)
 					if (isCoinRequestSuccessful(body)) {
-						markCoinSuccess()
+						markCoinSuccess(undefined, body)
 					} else {
-						const verified = await verifyCoinResult(beforeCoins)
+						const verified = await verifyCoinResult(beforeCoins, body)
 						if (verified) return
 						$.log("- 投币失败,原因 " + (body?.message || "未知"))
 						config.coins.failures = (config.coins.failures === 0 || typeof config.coins.failures === 'undefined' ? 1 : config.coins.failures + 1)
