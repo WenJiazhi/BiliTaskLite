@@ -41,9 +41,38 @@ const generateSign = body => md5(
 )
 
 const isCoinRequestSuccessful = body => body?.code === 0
+const shuffleArray = arr => [...arr].sort(() => Math.random() - 0.5)
 
-const markCoinSuccess = latestCoins => {
-	const beforeCoins = Number(config.coins.num || 0)
+async function getCoinProgress(logFailure = true) {
+	const myRequest = {
+		url: "https://api.bilibili.com/x/member/web/exp/reward",
+		headers: {
+			...baseHeaders
+		}
+	}
+	return await $.fetch(myRequest).then(response => {
+		try {
+			const body = $.toObj(response.body)
+			if (body?.code === 0) {
+				return Number(body?.data?.coins || 0)
+			}
+			if (logFailure) {
+				$.log("- 查询投币经验失败")
+				$.log("- 原因 " + body?.message)
+			}
+			return null
+		} catch (e) {
+			$.logErr(e, response)
+			return null
+		}
+	}, reason => {
+		logFailure && $.log("- 查询投币经验失败")
+		logFailure && $.log("- 原因 " + $.toStr(reason))
+		return null
+	})
+}
+
+const markCoinSuccess = (latestCoins, beforeCoins = Number(config.coins.num || 0)) => {
 	const nextCoins = typeof latestCoins === "number" ? latestCoins : beforeCoins + 10
 	const gainedCoins = Math.max(0, nextCoins - beforeCoins)
 	$.log("- 投币成功")
@@ -55,40 +84,26 @@ const markCoinSuccess = latestCoins => {
 	$.setItem($.name + "_daily_bonus", $.toStr(config))
 }
 
-async function verifyCoinResult(beforeCoins) {
-	const myRequest = {
-		url: "https://api.bilibili.com/x/member/web/exp/reward",
-		headers: {
-			...baseHeaders
+async function verifyCoinResult(beforeCoins, maxChecks = 4) {
+	for (let attempt = 1; attempt <= maxChecks; attempt++) {
+		const latestCoins = await getCoinProgress(attempt === 1)
+		if (typeof latestCoins === "number" && latestCoins > beforeCoins) {
+			$.log(`- 第${attempt}次复核确认投币经验已增加 ${latestCoins - beforeCoins}`)
+			markCoinSuccess(latestCoins, beforeCoins)
+			return true
+		}
+		if (typeof latestCoins === "number") {
+			config.coins.num = latestCoins
+			if (latestCoins > 0) config.coins.time = startTime
+			$.setItem($.name + "_daily_bonus", $.toStr(config))
+		}
+		if (attempt < maxChecks) {
+			$.log(`- 第${attempt}次复核未发现经验增长，等待后重试`)
+			await $.wait(400 * attempt)
 		}
 	}
-	return await $.fetch(myRequest).then(response => {
-		try {
-			const body = $.toObj(response.body)
-			if (body?.code !== 0) {
-				$.log("- 投币结果复核失败")
-				$.log("- 原因 " + body?.message)
-				return false
-			}
-			const latestCoins = Number(body?.data?.coins || 0)
-			if (latestCoins > beforeCoins) {
-				$.log(`- 接口返回异常，但复核确认今日投币经验已增加 ${latestCoins - beforeCoins}`)
-				markCoinSuccess(latestCoins)
-				return true
-			}
-			config.coins.num = latestCoins
-			if (latestCoins > 0 && !config['coins'].hasOwnProperty("time")) config.coins.time = startTime
-			$.setItem($.name + "_daily_bonus", $.toStr(config))
-			return false
-		} catch (e) {
-			$.logErr(e, response)
-			return false
-		}
-	}, reason => {
-		$.log("- 投币结果复核失败")
-		$.log("- 原因 " + $.toStr(reason))
-		return false
-	})
+	$.log("- 多次复核后经验仍未增长，本次投币视为未确认成功")
+	return false
 }
 
 const persistentStore = config => {
@@ -166,8 +181,10 @@ async function getCookie() {
 async function signBiliBili() {
 	if (config.cookie && await me()) {
 		await queryStatus()
+		const initialCoinExp = Number(config.coins.num || 0)
 		const exec_times = Number(config.Settings?.exec ?? 5)
 		const real_times = Math.max(0, exec_times - (Number(config.coins.num) / 10))
+		const targetCoins = Math.min(50, exec_times * 10)
 		let flag = isNotComplete(exec_times)
 		if (flag){
 			await dynamic()
@@ -182,11 +199,10 @@ async function signBiliBili() {
 			}
 
 			$.log("3️⃣ 投币任务")
-			config.coins?.failures > 0 && (config.coins.failures = 0)//重置投币失败次数
 			if (real_times === 0){
 				$.log(`- 今日已完成 记录于${config.coins.time}`)
 			} else {
-				for (let i = 0; i < real_times && (Math.floor(config.user.money) > 5 || ($.log("- 硬币不足,投币失败"), false)); i++) await coin()
+				await completeCoinTasks(targetCoins)
 				await queryStatus()
 			}
 			$.log("---- 经验值任务已完成")
@@ -251,6 +267,7 @@ async function signBiliBili() {
 			} 
 		}
 		flag = !isNotComplete(exec_times)
+		const gainedCoinExp = Math.max(0, Number(config.coins.num || 0) - initialCoinExp)
 		let title = `${$.name} 登录${config.user.num}/观看${config.watch.num}/分享${config.share.num}/投币${config.coins.num / 10}${flag ? "已完成" : "未完成"}`
 		$.log(`#### ${title}`)
 		$.log(`- 登录时间: ${config.user.time || "暂无"}`)
@@ -262,7 +279,7 @@ async function signBiliBili() {
 			title: `${$.name} [${config.user.uname}]`,
 			subTitle: `${flag ? "✅任务完成" : "❗️有未完成的任务"}`,
 			content:
-				`任务:登录(观看)${check("watch") ? "失败" : "+10exp"} 分享${check("share") ? "失败" : "+5exp"} 投币${check("coins") ? "0" : `+${real_times * 10}exp`}\n` +
+				`任务:登录(观看)${check("watch") ? "失败" : "+10exp"} 分享${check("share") ? "失败" : "+5exp"} 投币${check("coins") ? "0" : `+${gainedCoinExp}exp`}\n` +
 				`经验:当前${config.user.level_info.current_exp}/下级${config.user.level_info.next_exp}/满级28800\n` +
 				`等级:当前${config.user.level_info.current_level}级 升满级最快需${Math.max(0, Math.ceil(config.user.v6_exp / 65))}天` + vipMessage
 		}
@@ -455,61 +472,85 @@ async function share(aid, cid, short_link) {
 	}
 }
 
-async function coin() {
+async function completeCoinTasks(targetCoins) {
+	let like_uid_list = await getFavUid()
+	if (!like_uid_list?.length) {
+		$.log("- 获取随机关注用户列表失败")
+		return false
+	}
+	const triedAids = new Set()
+	const remainingTimes = Math.max(0, (targetCoins - Number(config.coins.num || 0)) / 10)
+	const maxAttempts = Math.max(12, remainingTimes * 6)
+	for (let attempt = 1; attempt <= maxAttempts && Number(config.coins.num || 0) < targetCoins; attempt++) {
+		if (Math.floor(config.user.money) <= 5) {
+			$.log("- 硬币不足,投币失败")
+			break
+		}
+		$.log(`- 投币尝试 ${attempt}/${maxAttempts}`)
+		const success = await coin(like_uid_list, triedAids)
+		if (Number(config.coins.num || 0) >= targetCoins) break
+		if (!success) {
+			$.log(`- 当前投币进度 ${Number(config.coins.num || 0) / 10}/${targetCoins / 10}，准备更换视频继续尝试`)
+			if (triedAids.size >= like_uid_list.length * 3) {
+				$.log("- 当前候选视频已基本尝试完，刷新列表后继续")
+				const refreshedList = await getFavUid()
+				if (refreshedList?.length) like_uid_list = refreshedList
+				triedAids.clear()
+			}
+		}
+		if (attempt < maxAttempts) await $.wait(500)
+	}
+	return Number(config.coins.num || 0) >= targetCoins
+}
+
+async function coin(like_uid_list, triedAids = new Set()) {
 	if (config.coins.num >= 50) {
 		$.log(`- 今日已完成 记录于${config.coins.time}`)
-		return
+		return true
 	}
-	let like_uid_list = await getFavUid()
-	if (like_uid_list && like_uid_list.length > 0) {
-		let aid = await getFavAid(like_uid_list)
-		//$.log("即将投币的视频aid: " + aid)
-		if (aid !== 0) {
-			const body = {
-				access_key: config.key,
-				aid,
-				multiply: 1,
-				select_like: 0,
+	const video = await getFavAid(like_uid_list, triedAids)
+	if (!video?.aid) {
+		$.log("- 获取可投币视频失败")
+		return false
+	}
+	triedAids.add(Number(video.aid))
+	const body = {
+		access_key: config.key,
+		aid: video.aid,
+		multiply: 1,
+		select_like: 0,
+	}
+	const myRequest = {
+		url: "https://app.bilibili.com/x/v2/view/coin/add",
+		headers: {
+			...baseHeaders,
+			'accept-encoding': 'gzip, deflate, br',
+			'content-type': 'application/x-www-form-urlencoded',
+			'app-key': 'iphone'
+		},
+		body: $.queryStr(body)
+	}
+	return await $.fetch(myRequest).then(async response => {
+		try {
+			const beforeCoins = Number(config.coins.num || 0)
+			const body = $.toObj(response.body)
+			$.log(`- 投币接口返回 code=${body?.code}, message=${body?.message}`)
+			if (!isCoinRequestSuccessful(body)) {
+				$.log("- 投币接口未直接确认成功，开始复核经验变化")
 			}
-			const myRequest = {
-				url: "https://app.bilibili.com/x/v2/view/coin/add",
-				headers: {
-					...baseHeaders,
-					'accept-encoding': 'gzip, deflate, br',
-					'content-type': 'application/x-www-form-urlencoded',
-					'app-key': 'iphone'
-				},
-				body: $.queryStr(body)
-			}
-			await $.fetch(myRequest).then(async response => {
-				try {
-					const beforeCoins = Number(config.coins.num || 0)
-					const body = $.toObj(response.body)
-					$.log(`- 投币接口返回 code=${body?.code}, message=${body?.message}`)
-					if (isCoinRequestSuccessful(body)) {
-						markCoinSuccess()
-					} else {
-						const verified = await verifyCoinResult(beforeCoins)
-						if (verified) return
-						$.log("- 投币失败,原因 " + (body?.message || "未知"))
-						config.coins.failures = (config.coins.failures === 0 || typeof config.coins.failures === 'undefined' ? 1 : config.coins.failures + 1)
-						$.setItem($.name + "_daily_bonus", $.toStr(config))
-						if (config.coins.failures < 11) {
-							$.log("- 正在重试...重试次数 " + (config.coins.failures - 1) + "(超过十次不再重试)")
-							await $.wait(300) //减少频繁请求报错概率
-							await coin()
-						}
-					}
-				} catch (e) {
-					$.logErr(e, response)
-				}
-			})
-		} else {
-			$.log("- 获取随机投币视频失败")
+			const verified = await verifyCoinResult(beforeCoins)
+			if (verified) return true
+			$.log("- 本次投币未确认成功，切换下一个视频")
+			return false
+		} catch (e) {
+			$.logErr(e, response)
+			return false
 		}
-	} else {
-		$.log("- 获取随机关注用户列表失败")
-	}
+	}, reason => {
+		$.log("- 投币请求失败")
+		$.log("- 原因 " + $.toStr(reason))
+		return false
+	})
 }
 
 async function getFavUid() {
@@ -544,41 +585,40 @@ async function getFavUid() {
 	})
 }
 
-async function getFavAid(arr) {
-	//$.log("- 获取关注列表中的随机视频")
-	let random_int = Math.floor((Math.random()*arr.length))
-	let random_mid = arr[random_int]
-	let wbiSigns = getWbiSigns({mid: random_mid})
-	const myRequest = {
-		url: `https://api.bilibili.com/x/space/wbi/arc/search?${wbiSigns}`,
-		headers: {
-			...baseHeaders,
-			'referer': 'https://space.bilibili.com'
-		}
-	}
-	return await $.fetch(myRequest).then(response => {
-		try {
-			const body = $.toObj(response.body)
-			if (body?.code === 0 && body.data?.list?.vlist.some(Boolean)) {
-				$.log("- 获取投币视频成功")
-				let vlist = body.data?.list?.vlist
-				let random_v_int = Math.floor((Math.random() * vlist.length))
-				let aid = vlist[random_v_int]?.aid
-				$.log("- 作者: " + vlist[random_v_int]['author'] + "; 视频标题: " + vlist[random_v_int]['title'])
-				return aid
-			} else {
-				$.log("- 获取投币视频失败")
-				$.log("- 原因 " + body?.message)
-				return 0
+async function getFavAid(arr, triedAids = new Set()) {
+	for (const random_mid of shuffleArray(arr)) {
+		let wbiSigns = getWbiSigns({mid: random_mid})
+		const myRequest = {
+			url: `https://api.bilibili.com/x/space/wbi/arc/search?${wbiSigns}`,
+			headers: {
+				...baseHeaders,
+				'referer': 'https://space.bilibili.com'
 			}
-		} catch (e) {
-			$.logErr(e, response)
 		}
-	}, reason => {
-		$.log("- 获取投币视频失败")
-		$.log("- 原因 " + $.toStr(reason))
-		return 0
-	})
+		const video = await $.fetch(myRequest).then(response => {
+			try {
+				const body = $.toObj(response.body)
+				if (body?.code === 0 && body.data?.list?.vlist.some(Boolean)) {
+					let vlist = shuffleArray(body.data?.list?.vlist).filter(item => item?.aid && !triedAids.has(Number(item.aid)))
+					if (vlist.length > 0) {
+						$.log("- 获取投币视频成功")
+						$.log("- 作者: " + vlist[0]['author'] + "; 视频标题: " + vlist[0]['title'])
+						return { aid: Number(vlist[0].aid) }
+					}
+				}
+				return null
+			} catch (e) {
+				$.logErr(e, response)
+				return null
+			}
+		}, reason => {
+			$.log("- 获取投币视频失败")
+			$.log("- 原因 " + $.toStr(reason))
+			return null
+		})
+		if (video?.aid) return video
+	}
+	return null
 }
 
 async function silver2coin() {
