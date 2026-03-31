@@ -40,7 +40,7 @@ const generateSign = body => md5(
 	+ 'c2ed53a74eeefe3cf99fbd01d8c9c375'
 )
 
-const isCoinRequestSuccessful = body => body?.code === 0
+const isCoinRequestSuccessful = body => body?.code === 0 && body?.message === "OK"
 const shuffleArray = arr => [...arr].sort(() => Math.random() - 0.5)
 
 async function getCoinProgress(logFailure = true) {
